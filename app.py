@@ -16,10 +16,25 @@ st.title("📈 IA_BETA_01_2X 리밸런스")
 
 @st.cache_data(ttl=1800)
 def fetch():
-    df = yf.download(["QLD","GLD","DBMF","SGOV"], period="400d", interval="1d",
-                     auto_adjust=True, progress=False)
-    c = df["Close"] if isinstance(df.columns, pd.MultiIndex) else df
-    return c.dropna(how="all").ffill()
+    # 티커별 개별 수집 + 재시도 (클라우드 yfinance 부분실패 방어)
+    cols = {}
+    for t in ["QLD","GLD","DBMF","SGOV"]:
+        for _ in range(3):
+            try:
+                h = yf.download(t, period="400d", interval="1d",
+                                auto_adjust=True, progress=False)
+                if h is not None and len(h) and "Close" in h.columns:
+                    cl = h["Close"]
+                    if isinstance(cl, pd.DataFrame): cl = cl.iloc[:, 0]
+                    cl = cl.dropna()
+                    if len(cl): cols[t] = cl; break
+            except Exception:
+                pass
+    df = pd.DataFrame(cols)
+    df.index = pd.to_datetime(df.index)
+    try: df.index = df.index.tz_localize(None)
+    except Exception: pass
+    return df.sort_index().ffill()
 
 def compute_target(px):
     rq = px["QLD"].pct_change()
@@ -69,7 +84,10 @@ def decide(hold, deposit, tgt):
 
 # ===== 수집 =====
 try:
-    px = fetch(); asof = px.index[-1]
+    px = fetch()
+    if px.empty or "QLD" not in px.columns:
+        st.error("⚠️ QLD 데이터 수집 실패 — 잠시 후 새로고침(yfinance 일시 오류)"); st.stop()
+    asof = px.index[-1]
     tgt, vol_now, wq = compute_target(px)
     stale = (pd.Timestamp.now()-asof.tz_localize(None)).days if asof.tzinfo else (pd.Timestamp.now()-asof).days
 except Exception as e:
