@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""IA_BETA_01_2X 실행 어드바이저 Ver1 — DESIGN_ver1.md 구현.
+"""IA_BETA_01_2X 실행 어드바이저 Ver2 — 추세게이트 추가.
 데이터검증 + 오늘 목표비율 + 보유5칸 입력 + 매매판정(밴드5% + DBMF add-only).
+Ver2: SPY 200일선 추세게이트 (하락추세 시 QLD 절반) — Phase0~5+ML 검증, walk-forward OOS.
 신호=미국 기초자산(yfinance). 상태는 매 실행 과거400일서 재계산(저장 불필요).
 """
 import streamlit as st, yfinance as yf, numpy as np, pandas as pd
 import warnings; warnings.filterwarnings("ignore")
 
-# ===== LOCKED config =====
+# ===== LOCKED config (Ver2) =====
 TARGET, WIN, FLOOR, CAP, INC = 0.20, 16, 0.20, 1.0, 0.15
 GOLD_FRAC, DBMF_FRAC, H_CAP = 0.60, 0.40, 0.60
 BAND, MIN_TRADE = 0.05, 0.005
+GATE_TICKER, GATE_MA, GATE_MULT = "SPY", 200, 0.5   # 추세게이트: SPY<200일SMA → QLD×0.5 (검증완료)
 
 st.set_page_config(page_title="베타2x 리밸런스", layout="centered", initial_sidebar_state="collapsed")
 st.title("📈 IA_BETA_01_2X 리밸런스")
@@ -18,7 +20,7 @@ st.title("📈 IA_BETA_01_2X 리밸런스")
 def fetch():
     # 티커별 개별 수집 + 재시도 (클라우드 yfinance 부분실패 방어)
     cols = {}
-    for t in ["QLD","GLD","DBMF","SGOV"]:
+    for t in ["QLD","GLD","DBMF","SGOV","SPY"]:
         for _ in range(3):
             try:
                 h = yf.download(t, period="400d", interval="1d",
@@ -45,10 +47,19 @@ def compute_target(px):
         if np.isnan(x): continue
         if x < cur: cur = x
         elif x - cur > INC: cur = x
-    wq = cur
+    wq_raw = cur
+    # 추세게이트: SPY < 200일선이면 QLD 절반 (Phase0~5+ML 검증, lookahead 없음=최신 종가 기준)
+    gate = {"on": False, "raw": wq_raw, "spy": None, "ma": None}
+    if GATE_TICKER in px.columns:
+        ma_s = px[GATE_TICKER].rolling(GATE_MA).mean()
+        spy_last, ma_last = float(px[GATE_TICKER].iloc[-1]), float(ma_s.iloc[-1])
+        gate.update(spy=spy_last, ma=ma_last)
+        if not np.isnan(ma_last) and spy_last < ma_last:
+            gate["on"] = True
+    wq = wq_raw * GATE_MULT if gate["on"] else wq_raw
     hb = min(H_CAP, max(0.0, 1 - wq))
     tgt = {"QLD": wq, "금": GOLD_FRAC*hb, "DBMF": DBMF_FRAC*hb, "현금": max(0.0, 1-wq-hb)}
-    return tgt, float(vol.iloc[-1]), wq
+    return tgt, float(vol.iloc[-1]), wq, gate
 
 def decide(hold, deposit, tgt):
     keys = ["QLD","금","DBMF","현금"]
@@ -88,7 +99,7 @@ try:
     if px.empty or "QLD" not in px.columns:
         st.error("⚠️ QLD 데이터 수집 실패 — 잠시 후 새로고침(yfinance 일시 오류)"); st.stop()
     asof = px.index[-1]
-    tgt, vol_now, wq = compute_target(px)
+    tgt, vol_now, wq, gate = compute_target(px)
     stale = (pd.Timestamp.now()-asof.tz_localize(None)).days if asof.tzinfo else (pd.Timestamp.now()-asof).days
 except Exception as e:
     st.error(f"데이터 수집 실패: {e}"); st.stop()
@@ -96,6 +107,14 @@ except Exception as e:
 # ===== 상단 배너 =====
 st.caption(f"🕒 기준일 **{asof.date()}** (미국장 종가) · 변동성 {vol_now*100:.0f}% → QLD {wq*100:.0f}%")
 if stale > 5: st.warning(f"⚠️ 데이터 {stale}일 전 — 휴장/수집지연 확인")
+# 추세게이트 상태 (발동 시 눈에 띄게)
+if gate["spy"] is not None:
+    if gate["on"]:
+        st.error(f"🔴 **추세게이트 발동** — SPY {gate['spy']:.0f} < 200일선 {gate['ma']:.0f} (하락추세) "
+                 f"→ QLD 절반 감산 ({gate['raw']*100:.0f}%→{wq*100:.0f}%). **방어 모드** — QLD 매도 지시 큼.")
+    else:
+        st.caption(f"📐 추세게이트 🟢 정상 — SPY {gate['spy']:.0f} > 200일선 {gate['ma']:.0f} "
+                   f"(상승추세 +{(gate['spy']/gate['ma']-1)*100:.0f}%) → QLD 그대로")
 
 # ===== 🎯 오늘 목표비율 =====
 st.subheader("🎯 오늘 목표비율")
@@ -147,10 +166,12 @@ else:
 # ===== ▸ 규칙/설정 =====
 with st.expander("▸ 규칙 / 설정", expanded=False):
     st.markdown(f"""
-**LOCKED 전략**: QLD vol-target(target {TARGET}/win{WIN}/floor{FLOOR}/cap{CAP}/비대칭inc{INC})
+**LOCKED 전략 (Ver2)**: QLD vol-target(target {TARGET}/win{WIN}/floor{FLOOR}/cap{CAP}/비대칭inc{INC})
+· **추세게이트: {GATE_TICKER}<{GATE_MA}일SMA → QLD×{GATE_MULT}** (Phase0~5+ML 검증, walk-forward OOS)
 · 바스켓 금{GOLD_FRAC:.0%}/DBMF{DBMF_FRAC:.0%}(h≤{H_CAP:.0%}) · 밴드 {BAND:.0%} · 미세거래<{MIN_TRADE:.1%} 무시
 **계좌**: ISA=QLD·금·현금(자유 리밸런스) / 해외=DBMF(add-only, 새 돈으로만 매수·매도X)
-**신호**: 미국 기초자산(QLD/GLD/DBMF) 종가, 상태는 매 실행 과거400일 재계산
-**검증성적**: CAGR~26%, MDD~-23%(실현)/-29%(MC기대), Calmar~1.16
-**⚠️ 위험**: 2x — 평시낙폭 -23~29%, 위기 -40%+, 회복 ~18개월. 장기자금만. 폭락에 적립 지속이 핵심.
+**신호**: 미국 기초자산(QLD/GLD/DBMF/SPY) 종가, 상태는 매 실행 과거400일 재계산
+**검증성적(실현 2013~26)**: CAGR 24.8%, MDD -19.5%, Calmar 1.27, robust 1.28, OOS test 1.46
+**정직한 MC 전망(운 제외)**: Calmar 중앙 **0.84** · MDD 중앙 **-28%**/-40%꼬리 **7%** · CAGR 중앙 24%
+**⚠️ 위험**: 2x — 미래기대 낙폭 중앙 -28%, 위기 -40%+, 회복 ~18개월. 장기자금만. 폭락에 적립 지속이 핵심.
 """)
